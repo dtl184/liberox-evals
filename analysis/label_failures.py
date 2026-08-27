@@ -1,24 +1,27 @@
-"""Reusable failure-labeling pipeline for LIBERO-X (or any eval_subgoals.py) rollouts.
+"""Reusable failure-labeling pipeline for LIBERO-X rollouts.
 
-Turns the per-step subgoal telemetry that eval_subgoals.py already logs into a
-labeled video manifest for semantic-alignment / RLHF-style review: for every
-failed episode, decide WHAT kind of failure it was (never grasped/placed vs.
-lost the plan after step 1 vs. a specific predicate type like exactin/close/
-turnon) using exact ground truth from the simulator, not a VLM guess.
+This script converts the per-step subgoal failure record produced by
+`eval_subgoals.py` into a labeled manifest of failed rollout videos for
+semantic-alignment analysis.
 
-Labels are derived, not annotated by hand, so this scales to any future
-eval_subgoals.py output directory with zero manual work.
+For each failed episode, it uses simulator ground truth to determine how the
+rollout failed. For example, it can distinguish between failures where the
+robot never completed an initial grasp or placement, failures where it made
+early progress but then lost the task sequence, and failures associated with
+specific predicate types such as `exactin`, `close`, or `turnon`.
 
 Usage:
     python label_failures.py --results-dir /path/to/results_full \
         --out-manifest /path/to/failure_labels.jsonl \
         [--organize-dir /path/to/labeled_videos] [--summary]
 
-Re-run any time a new eval_subgoals.py sweep finishes; point --results-dir at
-the new output and it produces a fresh manifest (and, optionally, a symlink
-tree organized by label for quick browsing) without touching prior runs.
+Run the script after any `eval_subgoals.py` evaluation sweep by pointing
+`--results-dir` to the corresponding output directory. It will generate a
+fresh JSONL manifest containing the derived failure labels. If
+`--organize-dir` is provided, it can also create a symlink-based directory
+tree organized by failure category for easier manual inspection, without
+modifying the original evaluation outputs.
 """
-import argparse
 import json
 import pathlib
 from collections import Counter

@@ -1,7 +1,6 @@
 """LIBERO-X eval with per-step subgoal instrumentation.
 
-Extends LIBERO-X's eval_template.py: same client-server rollout loop against
-an openpi policy server, but additionally queries the environment's BDDL goal
+Extends LIBERO-X's eval_template.py: queries the environment's BDDL goal
 predicates at every simulation step so we can tell, for each multi-step task,
 which subgoal(s) the policy completed and the exact step at which it stalled.
 
@@ -12,17 +11,6 @@ Run from the LIBERO-X repo root, e.g.:
     --num-trials-per-task 5 \
     --video-out-path results/LEVEL1
 
-See the top-level README for full setup and scaling notes. Two things worth
-knowing before you run this at scale:
-  1. Image preprocessing must rotate the camera frame 180 degrees (flip both
-     axes) to match openpi's train-time preprocessing -- see the comment at
-     the img/wrist_img lines below. Getting this wrong silently collapses
-     success rate to ~0% while still looking like the policy is "trying"
-     (see README "Known pitfalls").
-  2. Runs resume automatically: if --results-out-path already has rows for a
-     (task, episode) pair, that pair is skipped on the next run. Safe to
-     Ctrl-C and restart, or to let it survive a crash mid-sweep. Pass
-     --no-resume to force a clean re-run instead.
 """
 import collections
 import dataclasses
