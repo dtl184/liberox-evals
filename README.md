@@ -159,7 +159,7 @@ python src/analyze_results.py \
 
 The evaluator stores one JSON record for each episode.
 
-A simplified example looks like:
+An example looks like:
 
 ```json
 {
@@ -189,12 +189,7 @@ For example, the robot may correctly place a bowl and then accidentally knock it
 
 # Failure labeling
 
-The failure-labeling pipeline is run **after the evaluation**.
-
-It has two stages:
-
-1. identify exactly which subgoal failed using simulator results
-2. optionally use a VLM to explain why the failure happened and propose a recovery
+After receiving failed rollouts of LIBERO-X tasks, we want to understand on what exact subgoal the rollout failed. Then we use a VLM to process videos of the failed trajectory and output why the rollout failed (e.g. wrong grasp placement, robot closed a drawer that needed to be open, etc.) as well as what the robot can do to recover from failure. 
 
 The full pipeline is:
 
@@ -231,9 +226,7 @@ python analysis/label_failures.py \
   --out-manifest /path/to/results/failure_labels.jsonl
 ```
 
-This step does **not** use a VLM.
-
-It reads the exact goal-predicate information recorded during evaluation and determines where each failed episode stopped making progress.
+This step does not use a VLM, it reads the goal-predicate information recorded during evaluation and determines where each failed episode stopped making progress.
 
 For example, it may produce:
 
@@ -247,15 +240,11 @@ For example, it may produce:
 }
 ```
 
-This tells us **what part of the task failed**.
-
 For a multi-step task, the script can distinguish between cases such as:
 
 * failing on the first subgoal
 * successfully completing earlier subgoals but failing later
 * briefly satisfying a goal and then undoing it
-
-These labels come directly from the simulator and do not depend on visual interpretation.
 
 ## 2. Optionally sample failures for VLM analysis
 
@@ -271,7 +260,7 @@ python analysis/sample_for_vlm.py \
 
 The sampler selects failures across different failure categories and predicate types.
 
-If you want the VLM to analyze **every failure**, this step can be skipped and `failure_labels.jsonl` can be passed directly to `label_with_vlm.py`.
+If you want the VLM to analyze every failure, this step can be skipped and `failure_labels.jsonl` can be passed directly to `label_with_vlm.py`.
 
 ## 3. Diagnose failures with a VLM
 
@@ -292,14 +281,11 @@ The VLM receives:
 * simulator-derived information about the failure
 * evenly sampled frames from the rollout video
 
-The VLM is **not** being asked to decide whether the task succeeded. The simulator has already determined that.
-
 Instead, it is asked to determine:
 
-1. what visibly happened during the rollout
-2. the likely type of failure
-3. why the episode failed
-4. what the robot should do next to recover
+1. The failure mode of the rollout according to a preset failure taxonomy.
+2. Description of why the episode failed.
+3. What the robot should do next to recover and a justification for this. 
 
 For example:
 
@@ -315,40 +301,15 @@ For example:
 
 The failure categories are based on common VLA failure modes, including:
 
-* grasp failure
-* stuck or no-progress behavior
-* placement or insertion failure
-* unstable or dangerous behavior
-* unintended object displacement
-* manipulating the wrong object or target
-* other failures that do not fit the above categories
+- grasp_failure: the robot attempts to grasp the relevant object but does not successfully acquire it, including repeated unsuccessful grasp attempts.
+- stuck_or_no_progress: the robot becomes stuck, freezes, repeatedly executes ineffective behavior, or otherwise stops making meaningful progress toward the task.
+- placement_or_insertion_failure: the robot reaches the relevant target but fails the required placement, insertion, position, or object orientation.
+- unstable_or_dangerous_behavior: the robot exhibits unstable, erratic, unexpected, or potentially dangerous motion that prevents successful task completion.
+- object_displacement: the robot unintentionally knocks over, pushes away, drops, or otherwise displaces an object in a way that contributes to task failure.
+- wrong_object_or_target: the robot manipulates the wrong object or moves the correct object toward the wrong destination.
+- other: the observed failure does not fit one of the categories above; explain the failure clearly.
 
-The exact simulator predicate provides a grounded description of **what failed**, while the VLM provides a semantic description of **why it failed and how to recover**.
-
-## Using a different VLM
-
-The VLM labeling stage is designed to be separate from the evaluation pipeline.
-
-This means the same set of failed episodes can be analyzed with multiple VLMs:
-
-```text
-                        ┌─ Claude
-failure_labels.jsonl ───┼─ Gemini
-                        ├─ GPT
-                        └─ local VLM
-```
-
-Each backend should produce the same model-independent output fields:
-
-```text
-vlm_failure_mode
-vlm_confidence
-vlm_failure_reason
-vlm_recovery_action
-vlm_justification
-```
-
-This allows failure labels from different VLMs to be compared without rerunning the LIBERO-X evaluation.
+This script uses the Anthropic backend with Opus 4.8 by default.
 
 ## 4. Build a failure video gallery
 
@@ -371,16 +332,6 @@ The gallery pairs each failed rollout video with information such as:
 * the VLM's justification
 
 This makes it easier to browse failures and compare common failure modes across tasks or benchmark levels.
-
-## Important: image rotation
-
-When evaluating pi 0 or pi 0.5, the camera image must be rotated **180 degrees** before being sent to the policy.
-
-The reference openpi LIBERO code uses this preprocessing during evaluation. Without it, the policy may still appear to move toward objects while its success rate falls close to zero.
-
-`eval_subgoals.py` applies the correct rotation automatically.
-
-If you use this repo with another policy, check the preprocessing expected by that policy before evaluating it.
 
 ## References
 
