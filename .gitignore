@@ -1,0 +1,20 @@
+# Run outputs -- large, machine-generated, not part of the pipeline itself
+results*/
+*.mp4
+labeled_videos/
+gallery*.html
+*.jsonl
+!analysis/example_*.jsonl
+
+# Cloned/downloaded dependencies (recreated by setup_env.sh / download_checkpoint.sh)
+LIBERO-X/
+openpi/
+checkpoints/
+hf_cache/
+
+task_lists/
+*.log
+
+__pycache__/
+*.pyc
+.venv/

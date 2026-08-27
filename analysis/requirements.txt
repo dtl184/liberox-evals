@@ -1,0 +1,5 @@
+# Optional: only needed for the failure-labeling/gallery tools in this
+# directory, not for running the core eval pipeline (src/, scripts/).
+anthropic
+decord
+pillow
