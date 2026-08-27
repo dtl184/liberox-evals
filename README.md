@@ -1,8 +1,8 @@
-# LIBERO-X Eval Pipeline
+# LIBERO-X Evaluations
 
 A reusable pipeline for running VLA policies against [LIBERO-X](https://github.com/meituan/LIBERO-X) and getting more than a pass/fail number back: every goal predicate in every task is evaluated at every simulation step, so for any multi-step task you know exactly which subgoal the policy completed and which one it stalled on.
 
-Built and validated against π0.5 (`pi05_libero`) served via [openpi](https://github.com/Physical-Intelligence/openpi), but the harness only assumes an [openpi-client](https://github.com/Physical-Intelligence/openpi/tree/main/packages/openpi-client)-compatible websocket policy server, so any policy served that way works.
+Built and test with pi 0.5, but only assumes an [openpi-client](https://github.com/Physical-Intelligence/openpi/tree/main/packages/openpi-client)-compatible websocket policy server, so any policy served that way works.
 
 ## What is LIBERO-X, and how does it differ from LIBERO?
 
