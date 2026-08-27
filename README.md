@@ -6,7 +6,7 @@ Built and test with pi 0.5, but only assumes an [openpi-client](https://github.c
 
 ## What is LIBERO-X, and how does it differ from LIBERO?
 
-**[LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO)** (NeurIPS 2023) is a benchmark for lifelong robot learning: four fixed task suites (Spatial, Object, Goal, "10"/Long), about 130 tasks total, across a handful of tabletop/kitchen scenes with a fixed, small object set. It's designed to test structured knowledge transfer across a controlled task sequence, not robustness to novelty.
+**[LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO)** is a benchmark with four fixed task suites (Spatial, Object, Goal, "10"/Long), about 130 tasks total, across a handful of tabletop/kitchen scenes with a fixed, small object set.
 
 **LIBERO-X** (Meituan, RSS 2026) is built on the same underlying engine (it vendors LIBERO's robosuite/BDDL codebase directly) but is explicitly a *robustness* benchmark — it asks whether a policy generalizes or has memorized specific scenes. Concretely:
 
