@@ -281,7 +281,7 @@ The VLM receives:
 * simulator-derived information about the failure
 * evenly sampled frames from the rollout video (by default the VLM receives 8 frames in order to keep requests small, if a model with good native video support is used we could probably send the whole video).
 
-Instead, it is asked to determine:
+It is asked to determine:
 
 1. The failure mode of the rollout according to a preset failure taxonomy.
 2. Description of why the episode failed.
