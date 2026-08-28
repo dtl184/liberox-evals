@@ -279,7 +279,7 @@ The VLM receives:
 * the original task instruction
 * the exact simulator predicate that failed
 * simulator-derived information about the failure
-* evenly sampled frames from the rollout video
+* evenly sampled frames from the rollout video (by default the VLM receives 8 frames to requests small, if a model with good native video support is used we could probably send the whole video).
 
 Instead, it is asked to determine:
 
