@@ -1,47 +1,88 @@
-"""VLM-based failure diagnosis and recovery labeling for LIBERO-X rollouts.
+"""
+VLM-based failure diagnosis, temporal localization, and recovery labeling
+for LIBERO-X rollouts.
 
 For each failed rollout, the VLM receives:
+    - the entire rollout video
     - the task instruction
     - the exact simulator predicate that was not achieved
     - simulator-derived failure information
-    - evenly sampled frames from the rollout video
 
 The VLM then:
-    1. describes what happened,
-    2. classifies the visible failure mode,
+    1. identifies the primary visible failure mode,
+    2. identifies when failure behavior begins,
     3. explains why the episode failed, and
-    4. proposes what the robot should do next to recover.
+    4. proposes a recovery action.
 
-The currently implemented backend is Anthropic with Opus 4.8
+Failure onset follows a SAFE-style operational definition:
+
+    - obvious_mistake:
+        The earliest obvious task-relevant mistake that contributes to
+        the eventual failure and is not subsequently recovered from.
+
+    - operator_intervention:
+        The earliest point at which a reasonable human operator would
+        decide that the policy needs help to complete the task.
+
+    - timeout:
+        No earlier failure event can be identified. The policy continues
+        making plausible progress or simply fails to finish before the
+        episode horizon. The final timestep is used.
+
+Transient mistakes that the robot later successfully recovers from
+should NOT be labeled as failure onset.
+
+Temporal localization is done in two stages:
+
+    1. The complete rollout video is sent to the VLM to obtain a coarse
+       failure-onset timestamp.
+
+    2. A short window around that timestamp is extracted. Each original
+       rollout frame in that window is written as one second of a new
+       1-FPS video. The VLM then identifies the first frame at which the
+       failure becomes visible.
+
+This produces a frame-level VLM annotation while still allowing the
+model to see the complete rollout before making the decision.
+
+The current backend is Gemini because it supports native video input.
+Other video-capable VLMs can be added by implementing VLMBackend.
+
+Requirements:
+    pip install google-genai decord imageio imageio-ffmpeg
+
+Environment:
+    export GEMINI_API_KEY=...
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-ant-...
-
     python analysis/label_with_vlm.py \
-        --sample vlm_sample.jsonl \
+        --sample failure_labels.jsonl \
         --out vlm_labeled.jsonl
 
 Optional:
-    --num-frames 8
-    --limit 5
-    --backend anthropic
-    --model claude-opus-4-8
+    --backend gemini
+    --model gemini-3.1-pro-preview
+    --limit 20
+    --refine-window-seconds 3.0
+    --no-refine
 """
 
 import argparse
-import base64
-import io
 import json
 import pathlib
 import sys
+import tempfile
 import time
+from abc import ABC, abstractmethod
 
-import anthropic
+import imageio.v2 as imageio
 from decord import VideoReader, cpu
-from PIL import Image
 
 
-# Failure modes
+# ---------------------------------------------------------------------------
+# Failure taxonomy
+# ---------------------------------------------------------------------------
+
 TAXONOMY = """\
 - grasp_failure: the robot attempts to grasp the relevant object but does not successfully acquire it, including repeated unsuccessful grasp attempts
 - stuck_or_no_progress: the robot becomes stuck, freezes, repeatedly executes ineffective behavior, or otherwise stops making meaningful progress toward the task
@@ -49,349 +90,1184 @@ TAXONOMY = """\
 - unstable_or_dangerous_behavior: the robot exhibits unstable, erratic, unexpected, or potentially dangerous motion that prevents successful task completion
 - object_displacement: the robot unintentionally knocks over, pushes away, drops, or otherwise displaces an object in a way that contributes to task failure
 - wrong_object_or_target: the robot manipulates the wrong object or moves the correct object toward the wrong destination
-- other: the observed failure does not fit one of the categories above; explain the failure clearly"""
+- timeout_or_insufficient_progress: no discrete mistake is clearly identifiable and the robot simply does not complete the task before the episode ends
+- other: the observed failure does not fit one of the categories above; explain the failure clearly
+"""
 
 
-PROMPT_TEMPLATE = """You are reviewing frames from a failed robot manipulation rollout in a simulated tabletop or kitchen environment.
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
-The images above are frames shown in chronological order and sampled evenly from the beginning to the end of the episode.
+COARSE_PROMPT_TEMPLATE = """You are reviewing the COMPLETE video of a failed robot manipulation rollout in LIBERO-X.
+
+The video begins at rollout time 0.0 seconds and has a duration of approximately {duration_seconds:.2f} seconds.
 
 Task instruction:
 "{task_desc}"
 
-The simulator reports that this goal was NOT achieved by the end of the episode:
+The simulator reports that this goal predicate was NOT satisfied at the end of the episode:
 {failing_predicate}
 
 Additional simulator information:
 {detail}
 
-Your job is to determine what happened, why the episode failed, and what the robot should do next to recover.
+The simulator predicate tells you WHAT goal condition was unsatisfied at the end. It does NOT tell you when the behavior that caused the failure began.
 
-First, describe what you can concretely observe across the frames in 2-4 sentences. Focus on:
-- where the robot arm moves,
-- which object or mechanism it interacts with,
-- whether a grasp succeeds,
-- whether the relevant object moves,
-- whether an object is dropped, knocked over, or displaced,
-- whether the robot becomes stuck or behaves erratically,
-- where the relevant object ends up,
-- and how the final state differs from the requested goal.
+Your job is to determine:
 
-Only claim events that are supported by the provided frames. Do not invent actions that are not visible. For example, do not say that an object was dropped unless later frames provide evidence that it left the gripper away from the intended target.
+1. the primary visible failure mode,
+2. when the failure behavior begins,
+3. why the episode failed,
+4. and what corrective action should be taken.
 
-Then classify the PRIMARY visible failure using exactly one of these categories:
+FAILURE ONSET DEFINITION
+
+Use exactly one of the following onset types:
+
+obvious_mistake:
+    Use this when there is an identifiable task-relevant mistake such as
+    dropping an object, knocking an object away, manipulating the wrong
+    object, making a failed placement, or otherwise performing an action
+    that contributes to the eventual failure.
+
+    The onset should be the EARLIEST point where the mistake responsible
+    for the eventual failure becomes apparent.
+
+operator_intervention:
+    Use this when there is not one discrete mistake, but the robot reaches
+    a point where a reasonable human operator would decide that the policy
+    needs assistance.
+
+    Examples include repeatedly attempting an ineffective action, becoming
+    stuck, moving erratically, or clearly ceasing to make useful progress.
+
+timeout:
+    Use this when there is no defensible earlier failure point. If the robot
+    continues behaving plausibly but simply does not finish before the time
+    limit, the failure onset is the END of the rollout.
+
+IMPORTANT RULES
+
+- Do NOT treat the goal predicate being false early in the rollout as failure.
+  Most goal predicates are naturally false until the robot completes the task.
+
+- Do NOT label a temporary mistake as failure onset if the robot later
+  successfully recovers from that mistake.
+
+- Use the earliest mistake or intervention point that actually explains the
+  eventual failed outcome.
+
+- Do not use hindsight to label normal task execution as failure merely because
+  you know the episode eventually fails.
+
+- If there is no identifiable earlier point, use onset_type="timeout" and set
+  failure_onset_seconds to approximately {duration_seconds:.2f}.
+
+FAILURE TAXONOMY
+
+Choose exactly one:
 
 {taxonomy}
 
-If more than one failure occurs, select the category that best explains why the task ultimately failed. You may mention secondary failures in the failure reason.
+RECOVERY ACTION
 
-Next, explain the immediate reason the episode failed. This should be specific to the observed rollout and more informative than the broad failure category.
+The recovery action should describe what the robot should do at or immediately
+after the identified failure onset in order to recover.
 
-For example:
+It should identify:
+1. what object or mechanism to interact with,
+2. what corrective action to perform,
+3. what condition should be achieved before continuing.
 
-"The robot reached the correct bowl but repeatedly closed the gripper beside it, so the bowl was never lifted."
+Return ONLY a JSON object with this structure:
 
-"The robot transported the bottle to the correct region but released it horizontally, while the goal required the bottle to remain upright."
-
-"The robot missed the target region during placement and then began moving erratically instead of attempting to correct the placement."
-
-Finally, propose a recovery action.
-
-The recovery action should describe what the robot should do NEXT FROM THE OBSERVED FINAL STATE. Do not simply repeat the original task instruction.
-
-A useful recovery action should identify:
-1. what object or mechanism the robot should interact with,
-2. what corrective action it should perform, and
-3. what condition it should achieve before continuing with the rest of the task.
-
-Good recovery examples include:
-
-- "Move the gripper back above the bowl, center the gripper around it, and retry the grasp before continuing toward the target."
-- "Re-grasp the bottle, rotate it upright, and place it back inside the target region before releasing it."
-- "Release the incorrect object, move to the requested object, and establish a successful grasp before resuming the task."
-- "Move back to the drawer handle, establish contact with the handle, and pull outward until the drawer is visibly open."
-- "Stop the erratic motion, return the arm to a stable pose above the workspace, and retry the failed placement."
-
-If the frames do not provide enough information to confidently determine the exact recovery action, propose the safest reasonable retry of the failed step rather than inventing unseen state.
-
-End your response with a line beginning with "ANSWER:" followed by ONLY a JSON object with this exact structure:
-
-ANSWER: {{
+{{
     "failure_mode": "<one category from the taxonomy>",
+    "onset_type": "obvious_mistake|operator_intervention|timeout",
+    "failure_onset_seconds": <number>,
+    "failure_window_start_seconds": <number>,
+    "failure_window_end_seconds": <number>,
     "confidence": "high|medium|low",
-    "failure_reason": "<concise explanation of why this rollout failed>",
-    "recovery_action": "<specific next action the robot should take from the observed final state>",
-    "justification": "<one concise sentence citing the visual evidence supporting the diagnosis>"
-}}"""
+    "failure_reason": "<specific explanation of why this rollout failed>",
+    "recovery_action": "<specific corrective action from the failure state>",
+    "justification": "<concise visual evidence for the failure type and onset>"
+}}
+"""
 
 
-def extract_frames(video_path: str, num_frames: int):
-    """Extract evenly spaced frames from a rollout video."""
-    if num_frames < 2:
-        raise ValueError("--num-frames must be at least 2")
+REFINE_PROMPT_TEMPLATE = """You are reviewing a TEMPORALLY MAGNIFIED clip from a failed robot rollout.
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    total = len(vr)
+The complete rollout was already reviewed by another pass of the same VLM.
 
-    if total == 0:
-        raise ValueError(f"Video contains no frames: {video_path}")
+The coarse analysis identified:
 
-    idx = [
-        round(i * (total - 1) / (num_frames - 1))
-        for i in range(num_frames)
-    ]
+Failure mode:
+{failure_mode}
 
-    frames = vr.get_batch(idx).asnumpy()
-    return [Image.fromarray(frame) for frame in frames]
+Failure onset type:
+{onset_type}
+
+Failure reason:
+{failure_reason}
+
+Coarse onset estimate in the original rollout:
+{coarse_seconds:.2f} seconds
+
+Task instruction:
+"{task_desc}"
+
+Failed simulator predicate:
+{failing_predicate}
+
+TEMPORAL MAPPING
+
+This clip has been deliberately slowed down.
+
+Each SECOND of this clip corresponds to exactly ONE FRAME from the original
+rollout.
+
+Therefore:
+
+    refined clip second 0 = original rollout frame {start_frame}
+    refined clip second 1 = original rollout frame {start_frame_plus_one}
+    refined clip second 2 = original rollout frame {start_frame_plus_two}
+    ...
+
+The clip contains {num_frames} original rollout frames.
+
+Your job is ONLY to refine the temporal location of the failure.
+
+Find the EARLIEST frame in this clip where the failure identified above becomes
+visibly apparent or where operator intervention becomes justified.
+
+Remember:
+
+- Do not select a temporary mistake if the robot recovers from it.
+- Do not select a frame merely because the task is not complete yet.
+- Select the first frame associated with the behavior responsible for the
+  eventual failure.
+- If the coarse event is not actually visible in this clip, return null.
+
+Return ONLY:
+
+{{
+    "refined_second": <integer from 0 to {max_second}, or null>,
+    "confidence": "high|medium|low",
+    "justification": "<brief description of what changes at this frame>"
+}}
+"""
 
 
-def frame_to_b64_jpeg(frame: Image.Image) -> str:
-    """Convert a PIL image to a base64-encoded JPEG."""
-    buf = io.BytesIO()
-    frame.convert("RGB").save(buf, format="JPEG", quality=90)
-    return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
 
 def parse_json_response(text: str) -> dict:
-    """Extract the final ANSWER JSON object from the VLM response."""
-    marker_idx = text.rfind("ANSWER:")
+    """Extract a JSON object from a VLM response."""
 
-    if marker_idx != -1:
-        search_text = text[marker_idx + len("ANSWER:"):].strip()
-        reasoning = text[:marker_idx].strip()
-    else:
-        search_text = text.strip()
-        reasoning = ""
+    if not text:
+        raise ValueError("Empty VLM response")
 
-    # First try parsing everything following ANSWER: directly.
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        cleaned = "\n".join(lines).strip()
+
+    if cleaned.startswith("json"):
+        cleaned = cleaned[4:].strip()
+
     try:
-        parsed = json.loads(search_text)
-        parsed["_reasoning"] = reasoning
-        return parsed
+        return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Fall back to finding the first JSON object in the remaining text.
-    start = search_text.find("{")
+    start = cleaned.find("{")
 
     if start == -1:
-        return {
-            "failure_mode": "parse_error",
-            "confidence": "low",
-            "failure_reason": "",
-            "recovery_action": "",
-            "justification": text[:300],
-            "_reasoning": reasoning,
-        }
+        raise ValueError(
+            f"No JSON object found in VLM response: {text[:300]}"
+        )
+
+    decoder = json.JSONDecoder()
 
     try:
-        decoder = json.JSONDecoder()
-        parsed, _ = decoder.raw_decode(search_text[start:])
-        parsed["_reasoning"] = reasoning
+        parsed, _ = decoder.raw_decode(cleaned[start:])
         return parsed
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Could not parse VLM JSON response: {text[:500]}"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Video utilities
+# ---------------------------------------------------------------------------
+
+def get_video_metadata(video_path):
+    """Return frame count, FPS, and final-frame timestamp."""
+
+    vr = VideoReader(
+        str(video_path),
+        ctx=cpu(0),
+    )
+
+    num_frames = len(vr)
+
+    if num_frames == 0:
+        raise ValueError(
+            f"Video contains no frames: {video_path}"
+        )
+
+    fps = float(vr.get_avg_fps())
+
+    if fps <= 0:
+        raise ValueError(
+            f"Invalid FPS for video: {video_path}"
+        )
+
+    # Timestamp of the final visible frame.
+    duration_seconds = (
+        (num_frames - 1) / fps
+        if num_frames > 1
+        else 0.0
+    )
+
+    return {
+        "num_frames": num_frames,
+        "fps": fps,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def make_refinement_clip(
+    video_path,
+    output_path,
+    center_frame,
+    radius_frames,
+):
+    """
+    Extract a window around center_frame.
+
+    The output video is written at 1 FPS. Therefore each second of the
+    refinement video corresponds exactly to one original video frame.
+    """
+
+    vr = VideoReader(
+        str(video_path),
+        ctx=cpu(0),
+    )
+
+    total_frames = len(vr)
+
+    start_frame = max(
+        0,
+        center_frame - radius_frames,
+    )
+
+    end_frame = min(
+        total_frames - 1,
+        center_frame + radius_frames,
+    )
+
+    indices = list(
+        range(
+            start_frame,
+            end_frame + 1,
+        )
+    )
+
+    frames = vr.get_batch(
+        indices
+    ).asnumpy()
+
+    imageio.mimwrite(
+        str(output_path),
+        frames,
+        fps=1,
+    )
+
+    return {
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+        "num_frames": len(indices),
+    }
+
+
+def clamp(value, low, high):
+    return max(
+        low,
+        min(high, value),
+    )
+
+
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def format_timestamp(seconds):
+    """Format seconds as MM:SS.s."""
+
+    if seconds is None:
+        return ""
+
+    seconds = max(
+        0.0,
+        float(seconds),
+    )
+
+    minutes = int(
+        seconds // 60
+    )
+
+    remaining = (
+        seconds
+        - 60 * minutes
+    )
+
+    return (
+        f"{minutes:02d}:"
+        f"{remaining:04.1f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
+
+class VLMBackend(ABC):
+    """
+    Interface for video-capable VLM backends.
+
+    To add another backend, implement generate_video() and register
+    the class in BACKENDS below.
+    """
+
+    def __init__(
+        self,
+        model,
+        max_retries=4,
+    ):
+        self.model = model
+        self.max_retries = max_retries
+
+    @abstractmethod
+    def generate_video(
+        self,
+        video_path,
+        prompt,
+    ):
+        """
+        Return:
+
+            {
+                "text": "...",
+                "usage": {
+                    "input_tokens": int,
+                    "output_tokens": int
+                }
+            }
+        """
+        raise NotImplementedError
+
+
+class GeminiBackend(VLMBackend):
+    """Gemini native-video backend."""
+
+    def __init__(
+        self,
+        model="gemini-3.1-pro-preview",
+        max_retries=4,
+    ):
+        super().__init__(
+            model=model,
+            max_retries=max_retries,
+        )
+
+        try:
+            from google import genai
+        except ImportError as e:
+            raise ImportError(
+                "Gemini backend requires google-genai. "
+                "Install with: pip install google-genai"
+            ) from e
+
+        self.genai = genai
+        self.client = genai.Client()
+
+    def _wait_for_file(
+        self,
+        uploaded,
+    ):
+        """Wait until Gemini has processed the uploaded video."""
+
+        while True:
+            state = getattr(
+                uploaded,
+                "state",
+                None,
+            )
+
+            state_name = getattr(
+                state,
+                "name",
+                str(state) if state else "",
+            )
+
+            if state_name == "ACTIVE":
+                return uploaded
+
+            if state_name == "FAILED":
+                raise RuntimeError(
+                    "Gemini video processing failed"
+                )
+
+            time.sleep(2)
+
+            uploaded = self.client.files.get(
+                name=uploaded.name
+            )
+
+    @staticmethod
+    def _extract_usage(response):
+        usage = getattr(
+            response,
+            "usage_metadata",
+            None,
+        )
+
+        if usage is None:
+            return {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+        input_tokens = getattr(
+            usage,
+            "prompt_token_count",
+            0,
+        ) or 0
+
+        output_tokens = getattr(
+            usage,
+            "candidates_token_count",
+            0,
+        ) or 0
+
         return {
-            "failure_mode": "parse_error",
-            "confidence": "low",
-            "failure_reason": "",
-            "recovery_action": "",
-            "justification": text[:300],
-            "_reasoning": reasoning,
+            "input_tokens": int(
+                input_tokens
+            ),
+            "output_tokens": int(
+                output_tokens
+            ),
         }
 
+    def _generate_once(
+        self,
+        video_path,
+        prompt,
+    ):
+        uploaded = None
 
-def create_vlm_client(backend: str):
-    """Create the client for the selected VLM backend."""
-    if backend == "anthropic":
-        return anthropic.Anthropic()
-
-    # Add other backends here as desired
-
-    raise ValueError(f"Unsupported VLM backend: {backend}")
-
-
-def call_vlm(
-    backend,
-    client,
-    frames,
-    prompt,
-    model,
-    max_retries=4,
-):
-    """Send rollout frames and the diagnosis prompt to the selected VLM."""
-
-    content = []
-
-    for fi, frame in enumerate(frames):
-        if fi == 0:
-            label = "start"
-        elif fi == len(frames) - 1:
-            label = "end"
-        else:
-            label = f"t={fi}/{len(frames) - 1}"
-
-        content.append({
-            "type": "text",
-            "text": f"Frame {fi + 1} ({label}):",
-        })
-
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": frame_to_b64_jpeg(frame),
-            },
-        })
-
-    content.append({
-        "type": "text",
-        "text": prompt,
-    })
-
-    last_exc = None
-
-    for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=1400,
-                thinking={
-                    "type": "adaptive",
-                    "display": "summarized",
-                },
-                output_config={
-                    "effort": "high",
-                },
-                messages=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
+            uploaded = self.client.files.upload(
+                file=str(video_path)
+            )
+
+            uploaded = self._wait_for_file(
+                uploaded
+            )
+
+            # Video is intentionally placed before the text prompt.
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=[
+                    uploaded,
+                    prompt,
                 ],
             )
 
-            return response
+            text = getattr(
+                response,
+                "text",
+                None,
+            )
 
-        except anthropic.RateLimitError as e:
-            last_exc = e
-            time.sleep(min(60, 2 ** attempt * 2))
+            if not text:
+                raise RuntimeError(
+                    "Gemini returned no text"
+                )
 
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500:
+            return {
+                "text": text.strip(),
+                "usage": self._extract_usage(
+                    response
+                ),
+            }
+
+        finally:
+            if uploaded is not None:
+                try:
+                    self.client.files.delete(
+                        name=uploaded.name
+                    )
+                except Exception:
+                    # Uploaded files are temporary anyway. Failure to
+                    # delete should not invalidate an episode label.
+                    pass
+
+    def generate_video(
+        self,
+        video_path,
+        prompt,
+    ):
+        last_exc = None
+
+        for attempt in range(
+            self.max_retries
+        ):
+            try:
+                return self._generate_once(
+                    video_path=video_path,
+                    prompt=prompt,
+                )
+
+            except Exception as e:
                 last_exc = e
-                time.sleep(min(60, 2 ** attempt * 2))
-            else:
-                raise
 
-        except anthropic.APIConnectionError as e:
-            last_exc = e
-            time.sleep(min(60, 2 ** attempt * 2))
+                if (
+                    attempt
+                    == self.max_retries - 1
+                ):
+                    break
 
-    raise last_exc
+                wait_seconds = min(
+                    60,
+                    2 ** attempt * 2,
+                )
 
+                time.sleep(
+                    wait_seconds
+                )
 
-def extract_response_text(backend, response):
-    """Extract plain text from a VLM backend response."""
-    if backend == "anthropic":
-        text_blocks = [
-            block.text
-            for block in response.content
-            if block.type == "text"
-        ]
-        return "\n".join(text_blocks).strip()
-
-    raise ValueError(f"Unsupported VLM backend: {backend}")
+        raise last_exc
 
 
-def extract_usage(backend, response):
-    """Return normalized token-usage information when available."""
-    if backend == "anthropic":
-        return {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
+BACKENDS = {
+    "gemini": GeminiBackend,
+}
+
+
+def create_backend(
+    backend_name,
+    model,
+):
+    if backend_name not in BACKENDS:
+        available = ", ".join(
+            sorted(BACKENDS)
+        )
+
+        raise ValueError(
+            f"Unsupported VLM backend: "
+            f"{backend_name}. "
+            f"Available: {available}"
+        )
+
+    return BACKENDS[
+        backend_name
+    ](
+        model=model
+    )
+
+
+# ---------------------------------------------------------------------------
+# Labeling
+# ---------------------------------------------------------------------------
+
+def coarse_label(
+    backend,
+    row,
+    video_path,
+    metadata,
+):
+    """Analyze the complete rollout."""
+
+    prompt = COARSE_PROMPT_TEMPLATE.format(
+        duration_seconds=metadata[
+            "duration_seconds"
+        ],
+        task_desc=row.get(
+            "task_desc",
+            "",
+        ),
+        failing_predicate=row.get(
+            "failing_predicate",
+            "",
+        ),
+        detail=row.get(
+            "detail",
+            "",
+        ),
+        taxonomy=TAXONOMY,
+    )
+
+    result = backend.generate_video(
+        video_path=video_path,
+        prompt=prompt,
+    )
+
+    parsed = parse_json_response(
+        result["text"]
+    )
 
     return {
-        "input_tokens": 0,
-        "output_tokens": 0,
+        "parsed": parsed,
+        "text": result["text"],
+        "usage": result["usage"],
+    }
+
+
+def refine_failure_onset(
+    backend,
+    row,
+    video_path,
+    metadata,
+    coarse,
+    refine_window_seconds,
+):
+    """
+    Convert the VLM's coarse timestamp into a frame-level annotation.
+    """
+
+    parsed = coarse["parsed"]
+
+    onset_type = str(
+        parsed.get(
+            "onset_type",
+            "",
+        )
+    ).strip()
+
+    duration = metadata[
+        "duration_seconds"
+    ]
+
+    fps = metadata["fps"]
+
+    num_frames = metadata[
+        "num_frames"
+    ]
+
+    coarse_seconds = safe_float(
+        parsed.get(
+            "failure_onset_seconds"
+        ),
+        duration,
+    )
+
+    coarse_seconds = clamp(
+        coarse_seconds,
+        0.0,
+        duration,
+    )
+
+    # Timeout means there is intentionally no earlier event.
+    if onset_type == "timeout":
+        final_frame = (
+            num_frames - 1
+        )
+
+        return {
+            "frame": final_frame,
+            "seconds": duration,
+            "refined": False,
+            "refinement_text": "",
+            "refinement_usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+            "refinement_confidence":
+                parsed.get(
+                    "confidence",
+                    "low",
+                ),
+            "refinement_justification":
+                "No earlier failure event identified; "
+                "using the final frame.",
+        }
+
+    coarse_frame = int(
+        round(
+            coarse_seconds * fps
+        )
+    )
+
+    coarse_frame = int(
+        clamp(
+            coarse_frame,
+            0,
+            num_frames - 1,
+        )
+    )
+
+    radius_frames = max(
+        1,
+        int(
+            round(
+                refine_window_seconds
+                * fps
+            )
+        ),
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="liberox_failure_refine_"
+    ) as temp_dir:
+
+        refinement_path = (
+            pathlib.Path(temp_dir)
+            / "refinement.mp4"
+        )
+
+        clip = make_refinement_clip(
+            video_path=video_path,
+            output_path=refinement_path,
+            center_frame=coarse_frame,
+            radius_frames=radius_frames,
+        )
+
+        prompt = REFINE_PROMPT_TEMPLATE.format(
+            failure_mode=parsed.get(
+                "failure_mode",
+                "unknown",
+            ),
+            onset_type=onset_type,
+            failure_reason=parsed.get(
+                "failure_reason",
+                "",
+            ),
+            coarse_seconds=coarse_seconds,
+            task_desc=row.get(
+                "task_desc",
+                "",
+            ),
+            failing_predicate=row.get(
+                "failing_predicate",
+                "",
+            ),
+            start_frame=clip[
+                "start_frame"
+            ],
+            start_frame_plus_one=(
+                clip["start_frame"] + 1
+            ),
+            start_frame_plus_two=(
+                clip["start_frame"] + 2
+            ),
+            num_frames=clip[
+                "num_frames"
+            ],
+            max_second=(
+                clip["num_frames"] - 1
+            ),
+        )
+
+        refinement = backend.generate_video(
+            video_path=refinement_path,
+            prompt=prompt,
+        )
+
+        refinement_parsed = (
+            parse_json_response(
+                refinement["text"]
+            )
+        )
+
+    refined_second = (
+        refinement_parsed.get(
+            "refined_second"
+        )
+    )
+
+    if refined_second is None:
+        # Refinement could not confidently identify the event.
+        # Preserve the coarse estimate.
+        final_frame = coarse_frame
+
+        return {
+            "frame": final_frame,
+            "seconds": (
+                final_frame / fps
+            ),
+            "refined": False,
+            "refinement_text":
+                refinement["text"],
+            "refinement_usage":
+                refinement["usage"],
+            "refinement_confidence":
+                refinement_parsed.get(
+                    "confidence",
+                    "low",
+                ),
+            "refinement_justification":
+                refinement_parsed.get(
+                    "justification",
+                    "",
+                ),
+        }
+
+    try:
+        refined_second = int(
+            round(
+                float(
+                    refined_second
+                )
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        refined_second = None
+
+    if refined_second is None:
+        final_frame = coarse_frame
+
+    else:
+        refined_second = int(
+            clamp(
+                refined_second,
+                0,
+                clip["num_frames"] - 1,
+            )
+        )
+
+        final_frame = (
+            clip["start_frame"]
+            + refined_second
+        )
+
+    final_frame = int(
+        clamp(
+            final_frame,
+            0,
+            num_frames - 1,
+        )
+    )
+
+    final_seconds = (
+        final_frame / fps
+    )
+
+    return {
+        "frame": final_frame,
+        "seconds": final_seconds,
+        "refined": True,
+        "refinement_text":
+            refinement["text"],
+        "refinement_usage":
+            refinement["usage"],
+        "refinement_confidence":
+            refinement_parsed.get(
+                "confidence",
+                "low",
+            ),
+        "refinement_justification":
+            refinement_parsed.get(
+                "justification",
+                "",
+            ),
     }
 
 
 def label_one(
     backend,
-    client,
     row,
-    num_frames,
-    model,
+    refine=True,
+    refine_window_seconds=3.0,
 ):
-    """Diagnose one failed rollout and propose a recovery action."""
+    """Label one failed rollout."""
 
-    frames = extract_frames(
-        row["video_path"],
-        num_frames,
+    video_path = pathlib.Path(
+        row["video_path"]
     )
 
-    prompt = PROMPT_TEMPLATE.format(
-        task_desc=row.get("task_desc", ""),
-        failing_predicate=row.get(
-            "failing_predicate",
+    metadata = get_video_metadata(
+        video_path
+    )
+
+    coarse = coarse_label(
+        backend=backend,
+        row=row,
+        video_path=video_path,
+        metadata=metadata,
+    )
+
+    parsed = coarse["parsed"]
+
+    if refine:
+        temporal = refine_failure_onset(
+            backend=backend,
+            row=row,
+            video_path=video_path,
+            metadata=metadata,
+            coarse=coarse,
+            refine_window_seconds=(
+                refine_window_seconds
+            ),
+        )
+
+    else:
+        onset_type = parsed.get(
+            "onset_type",
             "",
+        )
+
+        coarse_seconds = safe_float(
+            parsed.get(
+                "failure_onset_seconds"
+            ),
+            metadata[
+                "duration_seconds"
+            ],
+        )
+
+        coarse_seconds = clamp(
+            coarse_seconds,
+            0.0,
+            metadata[
+                "duration_seconds"
+            ],
+        )
+
+        if onset_type == "timeout":
+            frame = (
+                metadata[
+                    "num_frames"
+                ]
+                - 1
+            )
+
+        else:
+            frame = int(
+                round(
+                    coarse_seconds
+                    * metadata["fps"]
+                )
+            )
+
+            frame = int(
+                clamp(
+                    frame,
+                    0,
+                    metadata[
+                        "num_frames"
+                    ]
+                    - 1,
+                )
+            )
+
+        temporal = {
+            "frame": frame,
+            "seconds": (
+                frame
+                / metadata["fps"]
+            ),
+            "refined": False,
+            "refinement_text": "",
+            "refinement_usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+            "refinement_confidence": "",
+            "refinement_justification": "",
+        }
+
+    coarse_usage = coarse[
+        "usage"
+    ]
+
+    refine_usage = temporal[
+        "refinement_usage"
+    ]
+
+    total_usage = {
+        "input_tokens": (
+            coarse_usage.get(
+                "input_tokens",
+                0,
+            )
+            + refine_usage.get(
+                "input_tokens",
+                0,
+            )
         ),
-        detail=row.get("detail", ""),
-        taxonomy=TAXONOMY,
+        "output_tokens": (
+            coarse_usage.get(
+                "output_tokens",
+                0,
+            )
+            + refine_usage.get(
+                "output_tokens",
+                0,
+            )
+        ),
+    }
+
+    coarse_onset_seconds = (
+        safe_float(
+            parsed.get(
+                "failure_onset_seconds"
+            )
+        )
     )
 
-    response = call_vlm(
-        backend=backend,
-        client=client,
-        frames=frames,
-        prompt=prompt,
-        model=model,
+    failure_window_start = (
+        safe_float(
+            parsed.get(
+                "failure_window_start_seconds"
+            )
+        )
     )
 
-    response_text = extract_response_text(
-        backend=backend,
-        response=response,
+    failure_window_end = (
+        safe_float(
+            parsed.get(
+                "failure_window_end_seconds"
+            )
+        )
     )
 
-    parsed = parse_json_response(response_text)
+    onset_frame = temporal[
+        "frame"
+    ]
 
-    usage = extract_usage(
-        backend=backend,
-        response=response,
-    )
+    onset_seconds = temporal[
+        "seconds"
+    ]
 
     return {
-        "vlm_failure_mode": parsed.get(
-            "failure_mode"
-        ),
-        "vlm_confidence": parsed.get(
-            "confidence"
-        ),
-        "vlm_failure_reason": parsed.get(
-            "failure_reason"
-        ),
-        "vlm_recovery_action": parsed.get(
-            "recovery_action"
-        ),
-        "vlm_justification": parsed.get(
-            "justification"
-        ),
-        "vlm_reasoning": parsed.get(
-            "_reasoning",
-            "",
-        ),
-        "vlm_raw_response": response_text,
-        "vlm_usage": usage,
+        "vlm_failure_mode":
+            parsed.get(
+                "failure_mode"
+            ),
+
+        "vlm_failure_onset_type":
+            parsed.get(
+                "onset_type"
+            ),
+
+        "vlm_failure_onset_seconds":
+            onset_seconds,
+
+        "vlm_failure_onset_timestamp":
+            format_timestamp(
+                onset_seconds
+            ),
+
+        # 0-based video frame index.
+        #
+        # eval_subgoals.py records one rollout image for each
+        # action-step observation, so this also provides the
+        # temporal index for probe alignment.
+        "vlm_failure_onset_frame":
+            onset_frame,
+
+        "vlm_failure_onset_step":
+            onset_frame,
+
+        "vlm_coarse_failure_onset_seconds":
+            coarse_onset_seconds,
+
+        "vlm_failure_window_start_seconds":
+            failure_window_start,
+
+        "vlm_failure_window_end_seconds":
+            failure_window_end,
+
+        "vlm_temporal_refined":
+            temporal["refined"],
+
+        "vlm_confidence":
+            parsed.get(
+                "confidence"
+            ),
+
+        "vlm_temporal_confidence":
+            temporal[
+                "refinement_confidence"
+            ],
+
+        "vlm_failure_reason":
+            parsed.get(
+                "failure_reason"
+            ),
+
+        "vlm_recovery_action":
+            parsed.get(
+                "recovery_action"
+            ),
+
+        "vlm_justification":
+            parsed.get(
+                "justification"
+            ),
+
+        "vlm_temporal_justification":
+            temporal[
+                "refinement_justification"
+            ],
+
+        "vlm_video_fps":
+            metadata["fps"],
+
+        "vlm_video_num_frames":
+            metadata[
+                "num_frames"
+            ],
+
+        "vlm_video_duration_seconds":
+            metadata[
+                "duration_seconds"
+            ],
+
+        "vlm_raw_response":
+            coarse["text"],
+
+        "vlm_refinement_raw_response":
+            temporal[
+                "refinement_text"
+            ],
+
+        "vlm_usage":
+            total_usage,
     }
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
+
     ap = argparse.ArgumentParser(
         description=(
-            "Use a VLM to diagnose LIBERO-X failure videos "
-            "and propose recovery actions."
+            "Use a video-capable VLM to diagnose "
+            "LIBERO-X failure rollouts, identify "
+            "failure onset, and propose recovery."
         )
     )
 
@@ -399,24 +1275,38 @@ def main():
         "--sample",
         required=True,
         help=(
-            "Input JSONL manifest containing task_desc, "
-            "failing_predicate, and video_path."
+            "Input JSONL manifest containing "
+            "task_desc, failing_predicate, "
+            "and video_path."
         ),
     )
 
     ap.add_argument(
         "--out",
         required=True,
-        help="Output labeled JSONL manifest.",
+        help=(
+            "Output labeled JSONL manifest."
+        ),
     )
 
     ap.add_argument(
-        "--num-frames",
-        type=int,
-        default=8,
+        "--backend",
+        choices=sorted(
+            BACKENDS.keys()
+        ),
+        default="gemini",
         help=(
-            "Number of evenly spaced video frames "
-            "to send to the VLM."
+            "Video-capable VLM backend."
+        ),
+    )
+
+    ap.add_argument(
+        "--model",
+        default=(
+            "gemini-3.1-pro-preview"
+        ),
+        help=(
+            "Model name for the selected backend."
         ),
     )
 
@@ -424,62 +1314,120 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help="Only process the first N episodes.",
+        help=(
+            "Only process the first N episodes."
+        ),
     )
 
     ap.add_argument(
-        "--backend",
-        choices=["anthropic"],
-        default="anthropic",
+        "--refine-window-seconds",
+        type=float,
+        default=3.0,
+        help=(
+            "Seconds before and after the coarse "
+            "failure estimate to inspect during "
+            "frame-level refinement."
+        ),
     )
 
     ap.add_argument(
-        "--model",
-        default="claude-opus-4-8",
+        "--no-refine",
+        action="store_true",
+        help=(
+            "Disable the second frame-level "
+            "temporal refinement pass."
+        ),
     )
 
     args = ap.parse_args()
 
-    client = create_vlm_client(args.backend)
+    backend = create_backend(
+        backend_name=args.backend,
+        model=args.model,
+    )
 
-    with open(args.sample) as f:
+    with open(
+        args.sample,
+        encoding="utf-8",
+    ) as f:
         rows = [
             json.loads(line)
             for line in f
             if line.strip()
         ]
 
-    if args.limit:
-        rows = rows[:args.limit]
+    if args.limit is not None:
+        rows = rows[
+            :args.limit
+        ]
 
-    out_path = pathlib.Path(args.out)
+    out_path = pathlib.Path(
+        args.out
+    )
+
     out_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     n_ok = 0
-    total_in = 0
-    total_out = 0
 
-    with out_path.open("w") as out_f:
-        for i, row in enumerate(rows):
-            video_path = row.get("video_path")
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    with out_path.open(
+        "w",
+        encoding="utf-8",
+    ) as out_f:
+
+        for i, row in enumerate(
+            rows
+        ):
+
+            video_path = row.get(
+                "video_path"
+            )
 
             if (
                 not video_path
-                or not pathlib.Path(video_path).exists()
+                or not pathlib.Path(
+                    video_path
+                ).exists()
             ):
+
                 row.update({
-                    "vlm_backend": args.backend,
-                    "vlm_model": args.model,
-                    "vlm_failure_mode": "video_missing",
-                    "vlm_confidence": "low",
-                    "vlm_failure_reason": "",
-                    "vlm_recovery_action": "",
-                    "vlm_justification": (
-                        "Rollout video is missing."
-                    ),
+                    "vlm_backend":
+                        args.backend,
+
+                    "vlm_model":
+                        args.model,
+
+                    "vlm_failure_mode":
+                        "video_missing",
+
+                    "vlm_failure_onset_type":
+                        "",
+
+                    "vlm_failure_onset_seconds":
+                        None,
+
+                    "vlm_failure_onset_frame":
+                        None,
+
+                    "vlm_failure_onset_step":
+                        None,
+
+                    "vlm_confidence":
+                        "low",
+
+                    "vlm_failure_reason":
+                        "",
+
+                    "vlm_recovery_action":
+                        "",
+
+                    "vlm_justification":
+                        "Rollout video is missing.",
                 })
 
                 out_f.write(
@@ -496,31 +1444,63 @@ def main():
             t0 = time.time()
 
             try:
+
                 result = label_one(
-                    backend=args.backend,
-                    client=client,
+                    backend=backend,
                     row=row,
-                    num_frames=args.num_frames,
-                    model=args.model,
+                    refine=(
+                        not args.no_refine
+                    ),
+                    refine_window_seconds=(
+                        args.refine_window_seconds
+                    ),
                 )
 
             except Exception as e:
+
                 print(
                     f"[{i + 1}/{len(rows)}] "
-                    f"ERROR: {type(e).__name__}: {e}",
+                    f"ERROR: "
+                    f"{type(e).__name__}: {e}",
                     file=sys.stderr,
                 )
 
                 row.update({
-                    "vlm_backend": args.backend,
-                    "vlm_model": args.model,
-                    "vlm_failure_mode": "api_error",
-                    "vlm_confidence": "low",
-                    "vlm_failure_reason": "",
-                    "vlm_recovery_action": "",
-                    "vlm_justification": (
-                        f"{type(e).__name__}: {e}"
-                    ),
+                    "vlm_backend":
+                        args.backend,
+
+                    "vlm_model":
+                        args.model,
+
+                    "vlm_failure_mode":
+                        "api_error",
+
+                    "vlm_failure_onset_type":
+                        "",
+
+                    "vlm_failure_onset_seconds":
+                        None,
+
+                    "vlm_failure_onset_frame":
+                        None,
+
+                    "vlm_failure_onset_step":
+                        None,
+
+                    "vlm_confidence":
+                        "low",
+
+                    "vlm_failure_reason":
+                        "",
+
+                    "vlm_recovery_action":
+                        "",
+
+                    "vlm_justification":
+                        (
+                            f"{type(e).__name__}: "
+                            f"{e}"
+                        ),
                 })
 
                 out_f.write(
@@ -534,20 +1514,40 @@ def main():
                 out_f.flush()
                 continue
 
-            elapsed = time.time() - t0
+            elapsed = (
+                time.time() - t0
+            )
 
-            row.update(result)
+            row.update(
+                result
+            )
 
-            row["vlm_backend"] = args.backend
-            row["vlm_model"] = args.model
+            row["vlm_backend"] = (
+                args.backend
+            )
 
-            total_in += result[
-                "vlm_usage"
-            ].get("input_tokens", 0)
+            row["vlm_model"] = (
+                args.model
+            )
 
-            total_out += result[
-                "vlm_usage"
-            ].get("output_tokens", 0)
+            usage = result.get(
+                "vlm_usage",
+                {},
+            )
+
+            total_input_tokens += (
+                usage.get(
+                    "input_tokens",
+                    0,
+                )
+            )
+
+            total_output_tokens += (
+                usage.get(
+                    "output_tokens",
+                    0,
+                )
+            )
 
             out_f.write(
                 json.dumps(
@@ -561,21 +1561,39 @@ def main():
 
             n_ok += 1
 
-            failure_category = row.get(
-                "failure_category",
-                "unknown",
-            )
-
             failure_mode = row.get(
                 "vlm_failure_mode",
                 "unknown",
             )
 
+            onset_type = row.get(
+                "vlm_failure_onset_type",
+                "unknown",
+            )
+
+            onset_seconds = row.get(
+                "vlm_failure_onset_seconds"
+            )
+
+            if onset_seconds is None:
+                onset_text = "?"
+            else:
+                onset_text = (
+                    f"{onset_seconds:.2f}s"
+                )
+
+            refined = row.get(
+                "vlm_temporal_refined",
+                False,
+            )
+
             print(
                 f"[{i + 1}/{len(rows)}] "
                 f"{elapsed:.1f}s  "
-                f"{failure_category:38s} "
-                f"-> {failure_mode}",
+                f"{failure_mode}  "
+                f"onset={onset_text}  "
+                f"type={onset_type}  "
+                f"refined={refined}",
                 file=sys.stderr,
             )
 
@@ -588,8 +1606,8 @@ def main():
 
     print(
         f"Tokens: "
-        f"{total_in} in / "
-        f"{total_out} out.",
+        f"{total_input_tokens} in / "
+        f"{total_output_tokens} out.",
         file=sys.stderr,
     )
 

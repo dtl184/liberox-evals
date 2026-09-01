@@ -24,6 +24,7 @@ modifying the original evaluation outputs.
 """
 import json
 import pathlib
+import argparse
 from collections import Counter
 
 
