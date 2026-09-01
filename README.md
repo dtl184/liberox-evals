@@ -189,7 +189,7 @@ For example, the robot may correctly place a bowl and then accidentally knock it
 
 # Failure labeling
 
-After receiving failed LIBERO-X rollouts, the failure-labeling pipeline first uses simulator predicates to determine which subgoal was not achieved. A video-capable VLM then reviews the rollout to determine the visible failure mode, identify when the behavior responsible for failure begins, explain the failure, and propose a recovery action.
+After receiving failed LIBERO-X rollouts, the failure-labeling pipeline first uses simulator predicates to determine which subgoal was not achieved. A VLM (we use Gemini Pro 3.1 because it has native video support) then reviews the rollout to determine the visible failure mode, identify when the behavior responsible for failure begins, explain the failure, and propose a recovery action.
 
 The full pipeline is:
 
@@ -264,7 +264,7 @@ If you want the VLM to analyze every failure, this step can be skipped and `fail
 
 ## 3. Diagnose and temporally localize failures with a VLM
 
-`label_with_vlm.py` currently uses Gemini because it supports native video input. Set a Gemini API key and install the video-labeling dependencies:
+Set a Gemini API key and install the video-labeling dependencies:
 
 ```bash
 export GEMINI_API_KEY=...
@@ -277,8 +277,6 @@ Then run:
 python analysis/label_with_vlm.py \
   --sample /path/to/results/vlm_sample.jsonl \
   --out /path/to/results/vlm_labeled.jsonl \
-  --backend gemini \
-  --model gemini-3.1-pro-preview
 ```
 
 The VLM receives:
