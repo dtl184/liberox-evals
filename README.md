@@ -11,7 +11,7 @@ For each episode, the evaluator records:
 * the goal predicate associated with that failure
 * a video of failed episodes
 
-The repository also includes an failure-labeling pipeline that uses a vision-language model (VLM) to describe why an episode failed and what the robot should do to recover.
+The repository also includes a failure-labeling pipeline that uses a video-capable vision-language model (VLM) to identify the visible failure mode, localize when the failure begins, explain why the episode failed, and propose a recovery action.
 
 The code was developed and tested with pi 0.5, but it can be used with other policies served through an `openpi-client` compatible policy server.
 
@@ -58,7 +58,7 @@ scripts/
 analysis/
   label_failures.py       Identify failed subgoals from simulator results
   sample_for_vlm.py       Select a subset of failures for VLM analysis
-  label_with_vlm.py       Use VLM to diagnose failures and propose recovery actions
+  label_with_vlm.py       Diagnose failures, localize failure onset, and propose recovery
   build_gallery.py        Build a browsable gallery of labeled failure videos
 ```
 
@@ -189,7 +189,7 @@ For example, the robot may correctly place a bowl and then accidentally knock it
 
 # Failure labeling
 
-After receiving failed rollouts of LIBERO-X tasks, we want to understand on what exact subgoal the rollout failed. Then we use a VLM to process videos of the failed trajectory and output why the rollout failed (e.g. wrong grasp placement, robot closed a drawer that needed to be open, etc.) as well as what the robot can do to recover from failure. 
+After receiving failed LIBERO-X rollouts, the failure-labeling pipeline first uses simulator predicates to determine which subgoal was not achieved. A VLM (we use Gemini Pro 3.1 because it has native video support) then reviews the rollout to determine the visible failure mode, identify when the behavior responsible for failure begins, explain the failure, and propose a recovery action.
 
 The full pipeline is:
 
@@ -226,7 +226,7 @@ python analysis/label_failures.py \
   --out-manifest /path/to/results/failure_labels.jsonl
 ```
 
-This step does not use a VLM, it reads the goal-predicate information recorded during evaluation and determines where each failed episode stopped making progress.
+This step does not use a VLM. It reads the goal-predicate information recorded during evaluation and determines where each failed episode stopped making progress.
 
 For example, it may produce:
 
@@ -262,54 +262,95 @@ The sampler selects failures across different failure categories and predicate t
 
 If you want the VLM to analyze every failure, this step can be skipped and `failure_labels.jsonl` can be passed directly to `label_with_vlm.py`.
 
-## 3. Diagnose failures with a VLM
+## 3. Diagnose and temporally localize failures with a VLM
 
-Run:
+Set a Gemini API key and install the video-labeling dependencies:
+
+```bash
+export GEMINI_API_KEY=...
+pip install google-genai decord imageio imageio-ffmpeg
+```
+
+Then run:
 
 ```bash
 python analysis/label_with_vlm.py \
   --sample /path/to/results/vlm_sample.jsonl \
   --out /path/to/results/vlm_labeled.jsonl \
-  --backend anthropic \
-  --model claude-opus-4-8
 ```
 
 The VLM receives:
 
+* the complete rollout video
 * the original task instruction
-* the exact simulator predicate that failed
+* the exact simulator predicate that was not satisfied
 * simulator-derived information about the failure
-* evenly sampled frames from the rollout video (by default the VLM receives 8 frames in order to keep requests small, if a model with good native video support is used we could probably send the whole video).
 
 It is asked to determine:
 
-1. The failure mode of the rollout according to a preset failure taxonomy.
-2. Description of why the episode failed.
-3. What the robot should do next to recover and a justification for this. 
+1. the primary visible failure mode
+2. when the failure behavior begins
+3. why the episode failed
+4. what the robot should do to recover
 
-For example:
+Failure timestep labeling is performed in two stages:
+
+1. **Coarse pass.** Gemini receives the complete rollout video and estimates the failure-onset time in seconds.
+2. **Frame-level refinement.** A short window around the coarse estimate is extracted from the original rollout. Each original frame is written as one second of a temporary 1-FPS video, allowing the VLM to select the earliest frame where the identified failure becomes visible.
+
+By default, the refinement window covers 3 seconds before and after the coarse estimate. This can be changed with:
+
+```bash
+--refine-window-seconds 3.0
+```
+
+The second pass can also be disabled:
+
+```bash
+--no-refine
+```
+
+For `timeout` failures, no refinement pass is needed; the final frame is used directly.
+
+### Failure taxonomy
+
+The current failure categories are:
+
+* **`grasp_failure`** — the robot attempts to grasp the relevant object but does not successfully acquire it, including repeated unsuccessful grasp attempts.
+* **`stuck_or_no_progress`** — the robot becomes stuck, freezes, repeatedly executes ineffective behavior, or otherwise stops making meaningful progress toward the task.
+* **`placement_or_insertion_failure`** — the robot reaches the relevant target but fails the required placement, insertion, position, or object orientation.
+* **`unstable_or_dangerous_behavior`** — the robot exhibits unstable, erratic, unexpected, or potentially dangerous motion that prevents successful task completion.
+* **`object_displacement`** — the robot unintentionally knocks over, pushes away, drops, or otherwise displaces an object in a way that contributes to task failure.
+* **`wrong_object_or_target`** — the robot manipulates the wrong object or moves the correct object toward the wrong destination.
+* **`timeout_or_insufficient_progress`** — no discrete mistake is clearly identifiable and the robot simply does not complete the task before the episode ends.
+* **`other`** — the observed failure does not fit one of the categories above.
+
+### VLM output
+
+The VLM annotations are appended to the simulator-derived failure record. An example looks like:
 
 ```json
 {
   "vlm_failure_mode": "placement_or_insertion_failure",
+  "vlm_failure_onset_type": "obvious_mistake",
+  "vlm_failure_onset_seconds": 12.43,
+  "vlm_failure_onset_timestamp": "00:12.4",
+  "vlm_failure_onset_frame": 248,
+  "vlm_failure_onset_step": 248,
+  "vlm_coarse_failure_onset_seconds": 12.5,
+  "vlm_temporal_refined": true,
   "vlm_confidence": "high",
-  "vlm_failure_reason": "The robot moved the bottle into the correct region but released it on its side, so the upright placement condition was not satisfied.",
+  "vlm_temporal_confidence": "high",
+  "vlm_failure_reason": "The robot moved the bottle into the target region but released it on its side, so the upright placement condition was not satisfied.",
   "vlm_recovery_action": "Re-grasp the bottle, rotate it upright, and place it back inside the target region before releasing it.",
-  "vlm_justification": "The final frames show the bottle lying horizontally in the target area."
+  "vlm_justification": "The rollout shows the bottle being released horizontally in the target area.",
+  "vlm_temporal_justification": "This is the first frame where the bottle begins to fall onto its side."
 }
 ```
 
-The failure categories are based on common VLA failure modes, including:
+`vlm_failure_onset_frame` is a 0-based index into the rollout video. Because `eval_subgoals.py` records one rollout image for each action-step observation, the same value is also stored as `vlm_failure_onset_step` for alignment with other timestep-level analyses.
 
-- grasp_failure: the robot attempts to grasp the relevant object but does not successfully acquire it, including repeated unsuccessful grasp attempts.
-- stuck_or_no_progress: the robot becomes stuck, freezes, repeatedly executes ineffective behavior, or otherwise stops making meaningful progress toward the task.
-- placement_or_insertion_failure: the robot reaches the relevant target but fails the required placement, insertion, position, or object orientation.
-- unstable_or_dangerous_behavior: the robot exhibits unstable, erratic, unexpected, or potentially dangerous motion that prevents successful task completion.
-- object_displacement: the robot unintentionally knocks over, pushes away, drops, or otherwise displaces an object in a way that contributes to task failure.
-- wrong_object_or_target: the robot manipulates the wrong object or moves the correct object toward the wrong destination.
-- other: the observed failure does not fit one of the categories above; explain the failure clearly.
-
-This script uses the Anthropic backend with Opus 4.8 by default.
+The output also retains the coarse response, refinement response, video metadata, and token usage for later analysis.
 
 ## 4. Build a failure video gallery
 
